@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
+	"net/url"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,6 +22,11 @@ const (
 	ipInfoAPIURLTemplate = "https://ipinfo.io/%s/json"
 )
 
+type PeeringDBResponse struct {
+	Data []struct {
+		Website string `json:"website"`
+	} `json:"data"`
+}
 type PrefixData struct {
 	Data struct {
 		Prefixes []struct {
@@ -32,6 +39,7 @@ type IPInfo struct {
 	City    string `json:"city"`
 	Region  string `json:"region"`
 	Country string `json:"country"`
+	ASN     string `json:"org"`
 }
 
 type CountryIPASN struct {
@@ -59,14 +67,37 @@ func main() {
 		asNumber := asnList[i]
 		prefixes := fetchPrefixes(asNumber, startTime)
 
+		pingNS := findPingableNS(asNumber)
+		var ipFound bool
+		if pingNS != "" {
+			lookupIP, err := net.LookupIP(pingNS)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+			var targetIP string
+			for _, ip := range lookupIP {
+				targetIP = ip.String()
+				break
+			}
+			location := getIPLocation(targetIP)
+			if strings.Contains(location.ASN, asNumber) {
+				ipFound = true
+				countryMap[location.Country] = append(countryMap[location.Country], CountryIPASN{IP: pingNS, ASN: asNumber})
+
+			}
+		}
+		if ipFound {
+			continue
+		}
 		// Step 2: Ping the IP addresses within the prefixes
-		pingableIP := findPingableIP(prefixes)
+		pingTarget := findPingableIP(prefixes, asNumber)
 
 		// Step 3: Retrieve location information of the first pingable IP
-		if pingableIP != "" {
-			location := getIPLocation(pingableIP)
-			countryMap[location.Country] = append(countryMap[location.Country], CountryIPASN{IP: pingableIP, ASN: asNumber})
-			fmt.Printf("AS%s Pingable IP: %s\nLocation: %s, %s, %s\n", asNumber, pingableIP, location.City, location.Region, location.Country)
+		if pingTarget != "" {
+			var location IPInfo
+			location = getIPLocation(pingTarget)
+			countryMap[location.Country] = append(countryMap[location.Country], CountryIPASN{IP: pingTarget, ASN: asNumber})
 		} else {
 			fmt.Println("No pingable IP found.")
 		}
@@ -100,9 +131,38 @@ func fetchPrefixes(asn string, startTime int64) []string {
 
 	return prefixes
 }
+func findPingableNS(asn string) string {
+	asnURL := getDomainFromPeeringDB(strings.Split(asn, "AS")[1])
+	parsedURL, err := url.Parse(asnURL)
+	if err != nil {
+		fmt.Println("Error parsing URL:", err)
+		return ""
+	}
+
+	// Get the host (which includes the domain and port if present)
+	domain := parsedURL.Hostname() // This will give you "sub.example.com"
+
+	if domain != "" {
+		if strings.Contains(domain, "www") {
+			domain = strings.Split(domain, "www.")[1]
+
+		}
+	}
+	nsServer := getNSServer(domain)
+	results := parallelPing([]string{nsServer})
+	fmt.Println(results)
+	for _, reachable := range results {
+		if reachable {
+			return nsServer
+		} else {
+			fmt.Printf("%s is not reachable\n", nsServer)
+		}
+	}
+	return ""
+}
 
 // findPingableIP finds the first pingable IP within the list of prefixes
-func findPingableIP(prefixes []string) string {
+func findPingableIP(prefixes []string, asn string) string {
 	concurrent := 10
 	for _, prefix := range prefixes {
 		if strings.Contains(prefix, ":") {
@@ -195,4 +255,47 @@ func getIPLocation(ip string) IPInfo {
 	}
 
 	return ipInfo
+}
+
+func getNSServer(domain string) string {
+	nsRecords, err := net.LookupNS(domain)
+	if err != nil {
+		fmt.Printf("Failed to perform NS lookup: %v\n", err)
+		return ""
+	}
+	for _, ns := range nsRecords {
+		fmt.Printf("  %s\n", ns.Host)
+		return ns.Host
+	}
+	return ""
+}
+
+func getDomainFromPeeringDB(asn string) string {
+	url := fmt.Sprintf("https://www.peeringdb.com/api/net?asn=%s", asn)
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Fatalf("Failed to query PeeringDB API: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("Failed to read response body: %v", err)
+	}
+
+	// Parse the JSON response
+	var pdbResponse PeeringDBResponse
+	if err := json.Unmarshal(body, &pdbResponse); err != nil {
+		log.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	// Extract and print the website
+	if len(pdbResponse.Data) > 0 && pdbResponse.Data[0].Website != "" {
+		fmt.Printf("Website for ASN %s: %s\n", asn, pdbResponse.Data[0].Website)
+		return pdbResponse.Data[0].Website
+	} else {
+		fmt.Printf("No website found for ASN %s\n", asn)
+	}
+	return ""
 }
